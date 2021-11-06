@@ -78,7 +78,12 @@ pub struct Config {
     pub raft_engine_purge_interval: ReadableDuration,
     // When a peer is not responding for this time, leader will not keep entry cache for it.
     pub raft_entry_cache_life_time: ReadableDuration,
+    // Deprecated! The configuration has no effect.
+    // They are preserved for compatibility check.
     // When a peer is newly added, reject transferring leader to the peer for a while.
+    #[doc(hidden)]
+    #[serde(skip_serializing)]
+    #[online_config(skip)]
     pub raft_reject_transfer_leader_duration: ReadableDuration,
 
     // Interval (ms) to check region whether need to be split or not.
@@ -211,6 +216,8 @@ pub struct Config {
     pub io_reschedule_concurrent_max_count: usize,
     pub io_reschedule_hotpot_duration: ReadableDuration,
 
+    pub raft_msg_flush_interval_us: u64,
+
     // Deprecated! These configuration has been moved to Coprocessor.
     // They are preserved for compatibility check.
     #[doc(hidden)]
@@ -303,6 +310,7 @@ impl Default for Config {
             waterfall_metrics: false,
             io_reschedule_concurrent_max_count: 4,
             io_reschedule_hotpot_duration: ReadableDuration::secs(5),
+            raft_msg_flush_interval_us: 250,
 
             // They are preserved for compatibility check.
             region_max_size: ReadableSize(0),
@@ -562,9 +570,6 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["raft_entry_cache_life_time"])
             .set(self.raft_entry_cache_life_time.as_secs() as f64);
-        CONFIG_RAFTSTORE_GAUGE
-            .with_label_values(&["raft_reject_transfer_leader_duration"])
-            .set(self.raft_reject_transfer_leader_duration.as_secs() as f64);
 
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["split_region_check_tick_interval"])
@@ -704,6 +709,9 @@ impl Config {
         CONFIG_RAFTSTORE_GAUGE
             .with_label_values(&["io_reschedule_hotpot_duration"])
             .set(self.io_reschedule_hotpot_duration.as_secs() as f64);
+        CONFIG_RAFTSTORE_GAUGE
+            .with_label_values(&["raft_msg_flush_interval_us"])
+            .set(self.raft_msg_flush_interval_us as f64);
     }
 
     fn write_change_into_metrics(change: ConfigChange) {
