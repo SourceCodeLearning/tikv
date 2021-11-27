@@ -3,7 +3,7 @@
 // #[PerformanceCriticalPath]
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{cmp, mem, u64, usize};
@@ -55,7 +55,7 @@ use crate::store::msg::RaftCommand;
 use crate::store::util::{admin_cmd_epoch_lookup, RegionReadProgress};
 use crate::store::worker::{HeartbeatTask, ReadDelegate, ReadExecutor, ReadProgress, RegionTask};
 use crate::store::{
-    Callback, Config, GlobalReplicationState, PdTask, ReadIndexContext, ReadResponse,
+    Callback, Config, GlobalReplicationState, PdTask, ReadIndexContext, ReadResponse, TxnExt,
 };
 use crate::{Error, Result};
 use collections::{HashMap, HashSet};
@@ -554,15 +554,8 @@ where
 
     pub txn_extra_op: Arc<AtomicCell<TxnExtraOp>>,
 
-    /// The max timestamp recorded in the concurrency manager is only updated at leader.
-    /// So if a peer becomes leader from a follower, the max timestamp can be outdated.
-    /// We need to update the max timestamp with a latest timestamp from PD before this
-    /// peer can work.
-    /// From the least significant to the most, 1 bit marks whether the timestamp is
-    /// updated, 31 bits for the current epoch version, 32 bits for the current term.
-    /// The version and term are stored to prevent stale UpdateMaxTimestamp task from
-    /// marking the lowest bit.
-    pub max_ts_sync_status: Arc<AtomicU64>,
+    /// Transaction extensions related to this peer.
+    pub txn_ext: Arc<TxnExt>,
 
     /// Check whether this proposal can be proposed based on its epoch.
     cmd_epoch_checker: CmdEpochChecker<EK::Snapshot>,
@@ -684,7 +677,7 @@ where
             check_stale_peers: vec![],
             local_first_replicate: false,
             txn_extra_op: Arc::new(AtomicCell::new(TxnExtraOp::Noop)),
-            max_ts_sync_status: Arc::new(AtomicU64::new(0)),
+            txn_ext: Arc::new(TxnExt::default()),
             cmd_epoch_checker: Default::default(),
             disk_full_peers: DiskFullPeers::default(),
             dangerous_majority_set: false,
@@ -1841,6 +1834,7 @@ where
 
                     // Snapshot has been applied.
                     self.last_applying_idx = self.get_store().truncated_index();
+                    self.last_compacted_idx = self.last_applying_idx + 1;
                     self.raft_group.advance_apply_to(self.last_applying_idx);
                     self.cmd_epoch_checker.advance_apply(
                         self.last_applying_idx,
@@ -3837,7 +3831,7 @@ where
 
         let mut resp = ctx.execute(&req, &Arc::new(region), read_index, None);
         if let Some(snap) = resp.snapshot.as_mut() {
-            snap.max_ts_sync_status = Some(self.max_ts_sync_status.clone());
+            snap.txn_ext = Some(self.txn_ext.clone());
         }
         resp.txn_extra_op = self.txn_extra_op.load();
         cmd_resp::bind_term(&mut resp.response, self.term());
@@ -3997,8 +3991,13 @@ where
                 if let Some(x) = self.disk_full_peers.peers.get_mut(&peer) {
                     // It can help to establish a quorum.
                     x.1 = true;
+                    // for merge region, all peers have been set to the max.
                     if !self.has_region_merge_proposal {
                         raft.adjust_max_inflight_msgs(peer, 1);
+                        debug!(
+                            "refill disk full peer max inflight to 1 in potential quorum set: region id {}, peer id {}",
+                            self.region_id, peer
+                        );
                     }
                 }
             }
@@ -4353,7 +4352,8 @@ where
         let term_low_bits = self.term() & ((1 << 32) - 1); // 32 bits
         let version_lot_bits = epoch.get_version() & ((1 << 31) - 1); // 31 bits
         let initial_status = (term_low_bits << 32) | (version_lot_bits << 1);
-        self.max_ts_sync_status
+        self.txn_ext
+            .max_ts_sync_status
             .store(initial_status, Ordering::SeqCst);
         info!(
             "require updating max ts";
@@ -4363,7 +4363,7 @@ where
         if let Err(e) = pd_scheduler.schedule(PdTask::UpdateMaxTimestamp {
             region_id: self.region_id,
             initial_status,
-            max_ts_sync_status: self.max_ts_sync_status.clone(),
+            txn_ext: self.txn_ext.clone(),
         }) {
             error!(
                 "failed to update max ts";
