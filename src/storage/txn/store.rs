@@ -9,7 +9,7 @@ use crate::storage::mvcc::{
     EntryScanner, Error as MvccError, ErrorInner as MvccErrorInner, NewerTsCheckState, PointGetter,
     PointGetterBuilder, Scanner as MvccScanner, ScannerBuilder,
 };
-use txn_types::{Key, KvPair, TimeStamp, TsSet, Value, WriteRef};
+use txn_types::{Key, KvPair, OldValue, TimeStamp, TsSet, Value, WriteRef};
 
 pub trait Store: Send {
     /// The scanner type returned by `scanner()`.
@@ -135,14 +135,27 @@ pub enum TxnEntry {
     Prewrite {
         default: KvPair,
         lock: KvPair,
-        old_value: Option<Value>,
+        old_value: OldValue,
     },
     Commit {
         default: KvPair,
         write: KvPair,
-        old_value: Option<Value>,
+        old_value: OldValue,
     },
     // TOOD: Add more entry if needed.
+}
+
+impl TxnEntry {
+    pub fn old_value(&mut self) -> &mut OldValue {
+        match self {
+            TxnEntry::Prewrite {
+                ref mut old_value, ..
+            } => old_value,
+            TxnEntry::Commit {
+                ref mut old_value, ..
+            } => old_value,
+        }
+    }
 }
 
 impl TxnEntry {
@@ -193,7 +206,7 @@ impl TxnEntry {
                 size += default.1.len();
                 size += write.0.len();
                 size += write.1.len();
-                size += old_value.as_ref().map_or(0, |v| v.len())
+                size += old_value.value_size();
             }
             TxnEntry::Prewrite {
                 default,
@@ -204,7 +217,7 @@ impl TxnEntry {
                 size += default.1.len();
                 size += lock.0.len();
                 size += lock.1.len();
-                size += old_value.as_ref().map_or(0, |v| v.len())
+                size += old_value.value_size();
             }
         }
         size
@@ -631,6 +644,7 @@ mod tests {
     use engine_traits::{IterOptions, ReadOptions};
     use kvproto::kvrpcpb::Context;
     use std::sync::Arc;
+    use tikv_kv::DummySnapshotExt;
 
     const KEY_PREFIX: &str = "key_prefix";
     const START_TS: TimeStamp = TimeStamp::new(10);
@@ -786,6 +800,7 @@ mod tests {
 
     impl Snapshot for MockRangeSnapshot {
         type Iter = MockRangeSnapshotIter;
+        type Ext<'a> = DummySnapshotExt;
 
         fn get(&self, _: &Key) -> EngineResult<Option<Value>> {
             Ok(None)
@@ -807,6 +822,9 @@ mod tests {
         }
         fn upper_bound(&self) -> Option<&[u8]> {
             Some(self.end.as_slice())
+        }
+        fn ext(&self) -> DummySnapshotExt {
+            DummySnapshotExt
         }
     }
 
@@ -1321,7 +1339,7 @@ mod tests {
             TxnEntry::Prewrite {
                 default: (vec![0; 10], vec![0; 10]),
                 lock: (vec![0; 10], vec![0; 10]),
-                old_value: None,
+                old_value: OldValue::None,
             }
             .size(),
             40
@@ -1331,7 +1349,7 @@ mod tests {
             TxnEntry::Prewrite {
                 default: (vec![0; 10], vec![0; 10]),
                 lock: (vec![0; 10], vec![0; 10]),
-                old_value: Some(vec![0; 10]),
+                old_value: OldValue::value(vec![0; 10]),
             }
             .size(),
             50
@@ -1341,7 +1359,7 @@ mod tests {
             TxnEntry::Commit {
                 default: (vec![0; 10], vec![0; 10]),
                 write: (vec![0; 10], vec![0; 10]),
-                old_value: None,
+                old_value: OldValue::None,
             }
             .size(),
             40
@@ -1351,7 +1369,7 @@ mod tests {
             TxnEntry::Commit {
                 default: (vec![0; 10], vec![0; 10]),
                 write: (vec![0; 10], vec![0; 10]),
-                old_value: Some(vec![0; 10]),
+                old_value: OldValue::value(vec![0; 10]),
             }
             .size(),
             50
