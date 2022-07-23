@@ -111,14 +111,14 @@ where
         concurrency_manager: ConcurrencyManager,
     ) -> Self {
         crate::metrics::STREAM_ENABLED.inc();
-        let pool = create_tokio_runtime(config.io_threads, "backup-stream")
+        let pool = create_tokio_runtime((config.num_threads / 2).max(1), "backup-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
         let range_router = Router::new(
             PathBuf::from(config.temp_path.clone()),
             scheduler.clone(),
-            config.temp_file_size_limit_per_task.0,
+            config.file_size_limit.0,
             config.max_flush_interval.0,
         );
 
@@ -159,7 +159,7 @@ where
             observer.clone(),
             meta_client.clone(),
             pd_client.clone(),
-            config.num_threads,
+            ((config.num_threads + 1) / 2).max(1),
         );
         pool.spawn(op_loop);
         Endpoint {
@@ -801,6 +801,53 @@ where
         }));
     }
 
+    fn on_update_global_checkpoint(&self, task: String) {
+        self.pool.block_on(async move {
+            let ts = self.meta_client.global_progress_of_task(&task).await;
+            match ts {
+                Ok(global_checkpoint) => {
+                    let r = self
+                        .range_router
+                        .update_global_checkpoint(&task, global_checkpoint, self.store_id)
+                        .await;
+                    match r {
+                        Ok(true) => {
+                            if let Err(err) = self
+                                .meta_client
+                                .set_storage_checkpoint(&task, global_checkpoint)
+                                .await
+                            {
+                                warn!("backup stream failed to set global checkpoint.";
+                                    "task" => ?task,
+                                    "global-checkpoint" => global_checkpoint,
+                                    "err" => ?err,
+                                );
+                            }
+                        }
+                        Ok(false) => {
+                            debug!("backup stream no need update global checkpoint.";
+                                "task" => ?task,
+                                "global-checkpoint" => global_checkpoint,
+                            );
+                        }
+                        Err(e) => {
+                            warn!("backup stream failed to update global checkpoint.";
+                                "task" => ?task,
+                                "err" => ?e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("backup stream failed to get global checkpoint.";
+                        "task" => ?task,
+                        "err" => ?e
+                    );
+                }
+            }
+        });
+    }
+
     /// Modify observe over some region.
     /// This would register the region to the RaftStore.
     pub fn on_modify_observe(&self, op: ObserveOp) {
@@ -839,6 +886,7 @@ where
             Task::MarkFailover(t) => self.failover_time = Some(t),
             Task::FlushWithMinTs(task, min_ts) => self.on_flush_with_min_ts(task, min_ts),
             Task::RegionCheckpointsOp(s) => self.handle_region_checkpoints_op(s),
+            Task::UpdateGlobalCheckpoint(task) => self.on_update_global_checkpoint(task),
         }
     }
 
@@ -887,6 +935,8 @@ where
 /// Create a standard tokio runtime
 /// (which allows io and time reactor, involve thread memory accessor),
 fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<Runtime> {
+    info!("create tokio runtime for backup stream"; "thread_name" => thread_name, "thread-count" => thread_count);
+
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(thread_name)
         // Maybe make it more configurable?
@@ -958,6 +1008,8 @@ pub enum Task {
     FlushWithMinTs(String, TimeStamp),
     /// The command for getting region checkpoints.
     RegionCheckpointsOp(RegionCheckpointOperation),
+    /// update global-checkpoint-ts to storage.
+    UpdateGlobalCheckpoint(String),
 }
 
 #[derive(Debug)]
@@ -1054,6 +1106,9 @@ impl fmt::Debug for Task {
                 .field(arg1)
                 .finish(),
             Self::RegionCheckpointsOp(s) => f.debug_tuple("GetRegionCheckpoints").field(s).finish(),
+            Self::UpdateGlobalCheckpoint(task) => {
+                f.debug_tuple("UpdateGlobalCheckpoint").field(task).finish()
+            }
         }
     }
 }
@@ -1090,6 +1145,7 @@ impl Task {
             Task::MarkFailover(_) => "mark_failover",
             Task::FlushWithMinTs(..) => "flush_with_min_ts",
             Task::RegionCheckpointsOp(..) => "get_checkpoints",
+            Task::UpdateGlobalCheckpoint(..) => "update_global_checkpoint",
         }
     }
 }
