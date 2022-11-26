@@ -2983,18 +2983,14 @@ impl<E: Engine> Engine for TxnTestEngine<E> {
         self.engine.modify_on_kv_engine(region_modifies)
     }
 
-    fn async_snapshot(
-        &mut self,
-        ctx: SnapContext<'_>,
-        cb: tikv_kv::Callback<Self::Snap>,
-    ) -> tikv_kv::Result<()> {
+    type SnapshotRes = impl Future<Output = tikv_kv::Result<Self::Snap>> + Send;
+    fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes {
         let txn_ext = self.txn_ext.clone();
-        self.engine.async_snapshot(
-            ctx,
-            Box::new(move |snapshot| {
-                cb(snapshot.map(|snapshot| TxnTestSnapshot { snapshot, txn_ext }))
-            }),
-        )
+        let f = self.engine.async_snapshot(ctx);
+        async move {
+            let snapshot = f.await?;
+            Ok(TxnTestSnapshot { snapshot, txn_ext })
+        }
     }
 
     fn async_write(
@@ -9771,7 +9767,7 @@ mod tests {
                         for_update_ts: 10.into(),
                         min_commit_ts: 11.into(),
                         last_change_ts: TimeStamp::zero(),
-                        versions_to_last_change: 0,
+                        versions_to_last_change: 1,
                     },
                     false
                 )
