@@ -22,7 +22,7 @@ mod snapshot;
 
 use std::{cmp, time::Instant};
 
-use engine_traits::{KvEngine, MiscExt, OpenOptions, RaftEngine, TabletFactory};
+use engine_traits::{KvEngine, MiscExt, RaftEngine};
 use error_code::ErrorCodeExt;
 use kvproto::{
     raft_cmdpb::AdminCmdType,
@@ -403,7 +403,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
 
         let persisted_number = self.async_writer.persisted_number();
         self.raft_group_mut().on_persist_ready(persisted_number);
-        let persisted_index = self.raft_group().raft.raft_log.persisted;
+        let persisted_index = self.persisted_index();
         /// The apply snapshot process order would be:
         /// - Get the snapshot from the ready
         /// - Wait for async writer to load this tablet
@@ -537,7 +537,7 @@ impl<EK: KvEngine, ER: RaftEngine> Storage<EK, ER> {
                 ready.snapshot(),
                 write_task,
                 ctx.snap_mgr.clone(),
-                ctx.tablet_factory.clone(),
+                ctx.tablet_registry.clone(),
             ) {
                 error!(self.logger(),"failed to apply snapshot";"error" => ?e)
             }
