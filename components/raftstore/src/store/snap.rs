@@ -1932,20 +1932,15 @@ impl Display for TabletSnapKey {
 #[derive(Clone)]
 pub struct TabletSnapManager {
     // directory to store snapfile.
-    base: String,
+    base: PathBuf,
 }
 
 impl TabletSnapManager {
-    pub fn new<T: Into<String>>(path: T) -> Self {
-        Self { base: path.into() }
-    }
-
-    pub fn init(&self) -> io::Result<()> {
+    pub fn new<T: Into<PathBuf>>(path: T) -> io::Result<Self> {
         // Initialize the directory if it doesn't exist.
-        let path = Path::new(&self.base);
+        let path = path.into();
         if !path.exists() {
-            file_system::create_dir_all(path)?;
-            return Ok(());
+            file_system::create_dir_all(&path)?;
         }
         if !path.is_dir() {
             return Err(io::Error::new(
@@ -1953,7 +1948,7 @@ impl TabletSnapManager {
                 format!("{} should be a directory", path.display()),
             ));
         }
-        Ok(())
+        Ok(Self { base: path })
     }
 
     pub fn tablet_gen_path(&self, key: &TabletSnapKey) -> PathBuf {
@@ -2003,7 +1998,12 @@ impl TabletSnapManager {
             {
                 continue;
             }
-            for e in file_system::read_dir(path)? {
+            let entries = match file_system::read_dir(path) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::from(e)),
+            };
+            for e in entries {
                 match e.and_then(|e| e.metadata()) {
                     Ok(m) => total_size += m.len(),
                     Err(e) if e.kind() == ErrorKind::NotFound => continue,
