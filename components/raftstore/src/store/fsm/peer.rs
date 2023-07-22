@@ -2684,6 +2684,10 @@ where
         let mut resp = ExtraMessage::default();
         resp.set_type(ExtraMessageType::MsgAvailabilityResponse);
         resp.wait_data = self.fsm.peer.wait_data;
+        let report = resp.mut_availability_context();
+        report.set_from_region_id(self.region_id());
+        report.set_from_region_epoch(self.region().get_region_epoch().clone());
+        report.set_trimmed(true);
         self.fsm
             .peer
             .send_extra_message(resp, &mut self.ctx.trans, from);
@@ -2824,7 +2828,9 @@ where
                 }
             }
             // It's v2 only message and ignore does no harm.
-            ExtraMessageType::MsgGcPeerResponse | ExtraMessageType::MsgFlushMemtable => (),
+            ExtraMessageType::MsgGcPeerResponse
+            | ExtraMessageType::MsgFlushMemtable
+            | ExtraMessageType::MsgRefreshBuckets => (),
         }
     }
 
@@ -6466,6 +6472,10 @@ where
             Some(self.fsm.peer.approximate_size.unwrap_or_default() + size);
         self.fsm.peer.approximate_keys =
             Some(self.fsm.peer.approximate_keys.unwrap_or_default() + keys);
+
+        if let Some(buckets) = &mut self.fsm.peer.region_buckets {
+            buckets.ingest_sst(keys, size);
+        }
         // The ingested file may be overlapped with the data in engine, so we need to
         // check it again to get the accurate value.
         self.fsm.peer.may_skip_split_check = false;
