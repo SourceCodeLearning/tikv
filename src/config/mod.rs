@@ -137,6 +137,8 @@ pub struct TitanCfConfig {
     #[online_config(skip)]
     pub blob_file_compression: CompressionType,
     #[online_config(skip)]
+    pub zstd_dict_size: ReadableSize,
+    #[online_config(skip)]
     pub blob_cache_size: ReadableSize,
     #[online_config(skip)]
     pub min_gc_batch_size: ReadableSize,
@@ -170,6 +172,7 @@ impl Default for TitanCfConfig {
         Self {
             min_blob_size: ReadableSize::kb(1), // disable titan default
             blob_file_compression: CompressionType::Lz4,
+            zstd_dict_size: ReadableSize::kb(0),
             blob_cache_size: ReadableSize::mb(0),
             min_gc_batch_size: ReadableSize::mb(16),
             max_gc_batch_size: ReadableSize::mb(64),
@@ -190,6 +193,15 @@ impl TitanCfConfig {
         let mut opts = RocksTitanDbOptions::new();
         opts.set_min_blob_size(self.min_blob_size.0);
         opts.set_blob_file_compression(self.blob_file_compression.into());
+        // To try zstd dict compression, set dict size to 4k, sample size to 100X dict
+        // size
+        opts.set_compression_options(
+            -14,                                // window_bits
+            32767,                              // level
+            0,                                  // strategy
+            self.zstd_dict_size.0 as i32,       // zstd dict size
+            self.zstd_dict_size.0 as i32 * 100, // zstd sample size
+        );
         opts.set_blob_cache(self.blob_cache_size.0 as usize, -1, false, 0.0);
         opts.set_min_gc_batch_size(self.min_gc_batch_size.0);
         opts.set_max_gc_batch_size(self.max_gc_batch_size.0);
@@ -3544,8 +3556,24 @@ impl TikvConfig {
                 .unwrap()
                 .to_owned();
         }
-        self.raft_store.raftdb_path = self.infer_raft_db_path(None)?;
-        self.raft_engine.config.dir = self.infer_raft_engine_path(None)?;
+
+        match (
+            self.raft_store.raftdb_path.is_empty(),
+            self.raft_engine.config.dir.is_empty(),
+        ) {
+            (false, true) => {
+                // If raftdb_path is specified, raft_engine_path will inherit it, this will be
+                // useful when updating from older version.
+                self.raft_engine.config.dir =
+                    self.infer_raft_engine_path(Some(self.raft_store.raftdb_path.as_str()))?;
+                self.raft_store.raftdb_path = self.infer_raft_db_path(None)?;
+            }
+            _ => {
+                self.raft_store.raftdb_path = self.infer_raft_db_path(None)?;
+                self.raft_engine.config.dir = self.infer_raft_engine_path(None)?;
+            }
+        }
+
         if self.log_backup.temp_path.is_empty() {
             self.log_backup.temp_path =
                 config::canonicalize_sub_path(&self.storage.data_dir, "log-backup-temp")?;
@@ -4075,7 +4103,10 @@ impl TikvConfig {
                 last_cfg.raftdb.wal_dir, self.raftdb.wal_dir
             ));
         }
-        if last_raft_engine_dir != self.raft_engine.config.dir {
+
+        if RaftDataStateMachine::raftengine_exists(Path::new(&last_raft_engine_dir))
+            && last_raft_engine_dir != self.raft_engine.config.dir
+        {
             return Err(format!(
                 "raft engine dir have been changed, former is '{}', \
                  current is '{}', please check if it is expected.",
@@ -4733,6 +4764,21 @@ mod tests {
         },
     };
 
+    fn create_mock_raftdb(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::File::create(path.join("CURRENT")).unwrap();
+    }
+
+    fn create_mock_raftengine(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::File::create(path.join("0000000000000001.raftlog")).unwrap();
+    }
+
+    fn create_mock_kv_data(path: &Path) {
+        fs::create_dir_all(path.join("db")).unwrap();
+        fs::File::create(path.join("db").join("CURRENT")).unwrap();
+    }
+
     #[test]
     fn test_case_macro() {
         let h = kebab_case!(HelloWorld);
@@ -4783,7 +4829,8 @@ mod tests {
 
         tikv_cfg.raft_engine.mut_config().dir = "/raft/wal_dir".to_owned();
         tikv_cfg.validate().unwrap();
-        tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap_err();
+        // no actual raft engine data
+        tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
 
         last_cfg.raft_engine.mut_config().dir = "/raft/wal_dir".to_owned();
         tikv_cfg.validate().unwrap();
@@ -4833,6 +4880,213 @@ mod tests {
                     expected
                 );
             }
+        }
+
+        let test_dir = tempfile::Builder::new()
+            .tempdir()
+            .unwrap()
+            .into_path()
+            .join("unittest_raft_engine_dir");
+        let data_dir = test_dir.join("data");
+
+        // simulate tikv restart
+        // enable raft engine: true
+        // need dump data from raftdb: false
+        // custom raft dir: true
+        {
+            let raft_dir = test_dir.join("raft");
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir = raft_dir.to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.mut_config().dir = raft_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_raftengine(&raft_dir);
+            create_mock_kv_data(&data_dir);
+
+            tikv_cfg.validate().unwrap();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        // simulate tikv restart
+        // enable raft engine: true
+        // need dump data from raftdb: false
+        // custom raft dir: false
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            tikv_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftengine(&data_dir.join("raft-engine"));
+
+            tikv_cfg.validate().unwrap();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        // simulate tikv update
+        // enable raft engine: true
+        // need dump data from raftdb: true
+        // custom raft dir: false
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            tikv_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftdb(&data_dir.join("raft"));
+
+            tikv_cfg.validate().unwrap();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        // multi raft engine dir
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            tikv_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftdb(&data_dir.join("raft"));
+            create_mock_raftengine(&data_dir.join("raft-engine"));
+
+            tikv_cfg.validate().unwrap_err();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        // simulate tikv update with custom raft dir
+        // enable raft engine: true
+        // need dump data from raftdb: true
+        // custom raft dir: false
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = test_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.mut_config().dir =
+                test_dir.join("raft-engine").to_str().unwrap().to_owned();
+            tikv_cfg.raft_store.raftdb_path = test_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftdb(&test_dir.join("raft"));
+
+            tikv_cfg.validate().unwrap();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        // simulate tikv update with custom raft dir
+        // enable raft engine: true
+        // need dump data from raftdb: true
+        // custom raft dir: false
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = test_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.mut_config().dir = "".to_owned();
+            tikv_cfg.raft_store.raftdb_path = test_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftdb(&test_dir.join("raft"));
+
+            tikv_cfg.validate().unwrap();
+            assert_eq!(
+                tikv_cfg.raft_engine.config.dir,
+                test_dir.join("raft").join("raft-engine").to_str().unwrap()
+            );
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        // simulate tikv downgrade to raftdb
+        // need dump data from raft-engine
+        // custom raft dir: false
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            last_cfg.raft_engine.enable = true;
+
+            tikv_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            tikv_cfg.raft_engine.enable = false;
+            tikv_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftengine(&data_dir.join("raft-engine"));
+
+            tikv_cfg.validate().unwrap();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap();
+            fs::remove_dir_all(&test_dir).unwrap();
+        }
+
+        {
+            tikv_cfg = TikvConfig::default();
+            last_cfg = TikvConfig::default();
+
+            last_cfg.raft_engine.mut_config().dir =
+                data_dir.join("raft-engine").to_str().unwrap().to_owned();
+            last_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            last_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+            last_cfg.raft_engine.enable = true;
+
+            tikv_cfg.raft_engine.mut_config().dir = "".to_owned();
+            tikv_cfg.raft_engine.enable = false;
+            tikv_cfg.raft_store.raftdb_path = data_dir.join("raft").to_str().unwrap().to_owned();
+            tikv_cfg.storage.data_dir = data_dir.to_str().unwrap().to_owned();
+
+            create_mock_kv_data(&data_dir);
+            create_mock_raftengine(&data_dir.join("raft-engine"));
+
+            tikv_cfg.validate().unwrap_err();
+            tikv_cfg.check_critical_cfg_with(&last_cfg).unwrap_err();
+            fs::remove_dir_all(&test_dir).unwrap();
         }
     }
 
@@ -5521,7 +5775,28 @@ mod tests {
         let diff = config_value_to_string(diff.into_iter().collect());
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].0.as_str(), "blob_run_mode");
-        assert_eq!(diff[0].1.as_str(), "fallback");
+        assert_eq!(diff[0].1.as_str(), "kFallback");
+    }
+
+    #[test]
+    fn test_update_titan_blob_run_mode_config() {
+        let mut cfg = TikvConfig::default();
+        cfg.rocksdb.titan.enabled = true;
+        let (_, cfg_controller, ..) = new_engines::<ApiV1>(cfg);
+        for run_mode in [
+            "kFallback",
+            "kNormal",
+            "kReadOnly",
+            "fallback",
+            "normal",
+            "read-only",
+        ] {
+            let change = HashMap::from([(
+                "rocksdb.defaultcf.titan.blob-run-mode".to_string(),
+                run_mode.to_string(),
+            )]);
+            cfg_controller.update_without_persist(change).unwrap();
+        }
     }
 
     #[test]
