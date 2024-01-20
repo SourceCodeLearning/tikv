@@ -19,7 +19,7 @@ use bytes::Bytes;
 use collections::{HashMap, HashSet};
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
 use engine_traits::{
-    Engines, KvEngine, PerfContext, RaftEngine, Snapshot, SnapshotContext, WriteBatch,
+    CacheRange, Engines, KvEngine, PerfContext, RaftEngine, Snapshot, SnapshotContext, WriteBatch,
     WriteOptions, CF_DEFAULT, CF_LOCK, CF_WRITE,
 };
 use error_code::ErrorCodeExt;
@@ -2975,7 +2975,6 @@ where
                 cbs,
                 self.region_buckets_info()
                     .bucket_stat()
-                    .as_ref()
                     .map(|b| b.meta.clone()),
             );
             apply.on_schedule(&ctx.raft_metrics);
@@ -4343,12 +4342,7 @@ where
         }
 
         match req.get_admin_request().get_cmd_type() {
-            AdminCmdType::Split | AdminCmdType::BatchSplit => {
-                ctx.insert(ProposalContext::SPLIT);
-                if !self.is_leader() {
-                    poll_ctx.raft_metrics.propose.non_leader_split.inc();
-                }
-            }
+            AdminCmdType::Split | AdminCmdType::BatchSplit => ctx.insert(ProposalContext::SPLIT),
             AdminCmdType::PrepareMerge => {
                 self.pre_propose_prepare_merge(poll_ctx, req)?;
                 ctx.insert(ProposalContext::PREPARE_MERGE);
@@ -4790,6 +4784,7 @@ where
             changes.as_ref(),
             &cc,
             self.is_in_force_leader(),
+            &self.peer_heartbeats,
         )?;
 
         ctx.raft_metrics.propose.conf_change.inc();
@@ -4866,7 +4861,7 @@ where
 
         let snap_ctx = if let Ok(read_ts) = decode_u64(&mut req.get_header().get_flag_data()) {
             Some(SnapshotContext {
-                region_id: self.region_id,
+                range: Some(CacheRange::from_region(&region)),
                 read_ts,
             })
         } else {
@@ -4879,7 +4874,6 @@ where
             snap.bucket_meta = self
                 .region_buckets_info()
                 .bucket_stat()
-                .as_ref()
                 .map(|s| s.meta.clone());
         }
         resp.txn_extra_op = self.txn_extra_op.load();
