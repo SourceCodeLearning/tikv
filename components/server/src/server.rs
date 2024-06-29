@@ -73,7 +73,7 @@ use raftstore::{
     },
     RaftRouterCompactedEventSender,
 };
-use region_cache_memory_engine::{
+use range_cache_memory_engine::{
     config::RangeCacheConfigManager, RangeCacheEngineContext, RangeCacheMemoryEngine,
     RangeCacheMemoryEngineStatistics,
 };
@@ -948,6 +948,7 @@ where
                 self.pd_client.clone(),
                 self.concurrency_manager.clone(),
                 BackupStreamResolver::V1(leadership_resolver),
+                self.core.encryption_key_manager.clone(),
             );
             backup_stream_worker.start(backup_stream_endpoint);
             self.core.to_stop.push(backup_stream_worker);
