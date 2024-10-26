@@ -4375,43 +4375,71 @@ def InMemoryEngine() -> RowPanel:
     layout.row(
         [
             graph_panel(
-                title="Snapshot Type Count",
-                description="Count of each snapshot type",
+                title="OPS",
+                description="Operation per second for cf",
+                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_kv_operations",
+                            by_labels=["instance", "type"],
+                        ),
+                        legend_format="{{type}}-{{instance}}",
+                        additional_groupby=True,
+                    ),
+                ],
+            )
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Region Cache Hit",
+                description="Count of region cache hit",
                 targets=[
                     target(
                         expr=expr_sum_rate(
                             "tikv_snapshot_type_count",
-                            by_labels=["type"],
+                            label_selectors=['type="in_memory_engine"'],
+                            by_labels=["instance"],
                         ),
-                        legend_format="{{type}}",
+                        legend_format="count-{{instance}}",
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Region Cache Hit Rate",
+                description="Region cache hit rate",
+                yaxes=yaxes(left_format=UNITS.PERCENT_UNIT),
+                targets=[
+                    target(
+                        expr=expr_operator(
+                            expr_sum_rate(
+                                "tikv_snapshot_type_count",
+                                label_selectors=['type="in_memory_engine"'],
+                                by_labels=["instance"],
+                            ),
+                            "/",
+                            expr_sum_rate(
+                                "tikv_snapshot_type_count",
+                                by_labels=["instance"],
+                            ),
+                        ),
+                        legend_format="rate-{{instance}}",
                         additional_groupby=True,
                     ),
                 ],
             ),
             graph_panel(
-                title="Snapshot Failed Reason",
-                description="Reasons for why rance cache snapshot is not acquired",
+                title="Region Cache Miss Reason",
+                description="Reasons for region cache miss",
                 targets=[
                     target(
                         expr=expr_sum_rate(
                             "tikv_in_memory_engine_snapshot_acquire_failed_reason_count",
-                            by_labels=["type"],
-                        ),
-                        legend_format="{{type}}",
-                        additional_groupby=True,
-                    ),
-                ],
-            ),
-            graph_panel(
-                title="Region Count",
-                description="The count of different types of region",
-                targets=[
-                    target(
-                        expr=expr_avg(
-                            "tikv_in_memory_engine_cache_count",
                             by_labels=["instance", "type"],
                         ),
-                        legend_format="{{instance}}--{{type}}",
+                        legend_format="{{type}}-{{instance}}",
                     ),
                 ],
             ),
@@ -4429,6 +4457,19 @@ def InMemoryEngine() -> RowPanel:
                             "tikv_in_memory_engine_memory_usage_bytes",
                             by_labels=["instance"],
                         ),
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Region Count",
+                description="The count of different types of region",
+                targets=[
+                    target(
+                        expr=expr_avg(
+                            "tikv_in_memory_engine_cache_count",
+                            by_labels=["instance", "type"],
+                        ),
+                        legend_format="{{instance}}--{{type}}",
                     ),
                 ],
             ),
@@ -4637,6 +4678,79 @@ def InMemoryEngine() -> RowPanel:
                             by_labels=["type"],
                         ),
                         legend_format="avg",
+                        additional_groupby=True,
+                    ),
+                ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Oldest Auto GC SafePoint",
+                description="Unlike the auto gc safe point used for TiKV, the safe point for in-memory engine is per region and this is the oldest one",
+                yaxes=yaxes(left_format=UNITS.DATE_TIME_ISO),
+                targets=[
+                    target(
+                        expr=expr_max(
+                            "tikv_in_memory_engine_oldest_safe_point",
+                        )
+                        .extra("/ (2^18)")
+                        .skip_default_instance_selector(),
+                        additional_groupby=True,
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Newest Auto GC SafePoint",
+                description="Unlike the auto gc safe point used for TiKV, the safe point for in-memory engine is per region and this is the newest one",
+                yaxes=yaxes(left_format=UNITS.DATE_TIME_ISO),
+                targets=[
+                    target(
+                        expr=expr_max(
+                            "tikv_in_memory_engine_newest_safe_point",
+                        )
+                        .extra("/ (2^18)")
+                        .skip_default_instance_selector(),
+                        additional_groupby=True,
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Auto GC SafePoint Gap",
+                description="The gap between newest auto gc safe point and oldest auto gc safe point of regions cached in the in-memroy engine",
+                yaxes=yaxes(left_format=UNITS.MILLI_SECONDS),
+                targets=[
+                    target(
+                        expr=expr_operator(
+                            expr_sum(
+                                "tikv_in_memory_engine_newest_safe_point",
+                            )
+                            .extra("/ (2^18)")
+                            .skip_default_instance_selector(),
+                            "-",
+                            expr_sum(
+                                "tikv_in_memory_engine_oldest_safe_point",
+                            )
+                            .extra("/ (2^18)")
+                            .skip_default_instance_selector(),
+                        ),
+                        additional_groupby=True,
+                        legend_format="{{instance}}",
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Auto GC SafePoint Gap With TiKV",
+                description="The gap between tikv auto gc safe point and in-memory engine oldest auto gc safe point",
+                yaxes=yaxes(left_format=UNITS.MILLI_SECONDS),
+                targets=[
+                    target(
+                        expr=expr_max(
+                            "tikv_safe_point_gap_with_in_memory_engine",
+                        )
+                        .extra("/ (2^18)")
+                        .skip_default_instance_selector(),
                         additional_groupby=True,
                     ),
                 ],
