@@ -4,12 +4,12 @@
 use txn_types::{CommitRole, Key, TimeStamp, Write, WriteType};
 
 use crate::storage::{
+    Snapshot,
     mvcc::{
-        metrics::{MVCC_CONFLICT_COUNTER, MVCC_DUPLICATE_CMD_COUNTER_VEC},
         ErrorInner, MvccInfo, MvccTxn, ReleasedLock, Result as MvccResult, SnapshotReader,
+        metrics::{MVCC_CONFLICT_COUNTER, MVCC_DUPLICATE_CMD_COUNTER_VEC},
     },
     txn::actions::mvcc::collect_mvcc_info_for_debug,
-    Snapshot,
 };
 
 pub fn commit<S: Snapshot>(
@@ -37,18 +37,20 @@ pub fn commit<S: Snapshot>(
         Some(lock) if lock.ts == reader.start_ts => {
             // A lock with larger min_commit_ts than current commit_ts can't be committed
             if commit_ts < lock.min_commit_ts {
+                let primary_key = Key::from_raw(&lock.primary);
                 // The min_commit_ts can be pushed to a larger value before
                 // committing the primary.
                 // When committing the secondary, the commit_ts must be determined and
                 // should always be greater than the min_commit_ts.
                 // If not, it is an unexpected case and may be a bug.
-                let unexpected = matches!(commit_role, Some(CommitRole::Secondary));
+                let unexpected = key != primary_key;
                 // collect mvcc info when an unexpected case happens.
                 let mvcc_info = unexpected.then(|| collect_mvcc(reader)).flatten();
                 info_or_error!(
                     !unexpected;
                     "trying to commit with smaller commit_ts than min_commit_ts";
                     "key" => %key,
+                    "primary_key" => %primary_key,
                     "start_ts" => reader.start_ts,
                     "commit_ts" => commit_ts,
                     "min_commit_ts" => lock.min_commit_ts,
@@ -158,6 +160,8 @@ pub mod tests {
     use kvproto::kvrpcpb::Context;
     #[cfg(test)]
     use kvproto::kvrpcpb::PrewriteRequestPessimisticAction::*;
+    #[cfg(test)]
+    use kvproto::kvrpcpb::{Assertion, AssertionLevel};
     use tikv_kv::SnapContext;
     #[cfg(test)]
     use txn_types::{LastChange, TimeStamp};
@@ -169,16 +173,16 @@ pub mod tests {
         must_prewrite_lock, must_prewrite_put, must_prewrite_put_for_large_txn,
         must_prewrite_put_impl, must_prewrite_put_with_txn_soucre, must_rollback,
     };
+    use crate::storage::{
+        Engine,
+        mvcc::{Error, MvccTxn, tests::*},
+    };
     #[cfg(test)]
     use crate::storage::{
+        TestEngineBuilder, TxnStatus,
         mvcc::SHORT_VALUE_MAX_LEN,
         txn::commands::check_txn_status,
         txn::tests::{must_acquire_pessimistic_lock, must_pessimistic_prewrite_put},
-        TestEngineBuilder, TxnStatus,
-    };
-    use crate::storage::{
-        mvcc::{tests::*, Error, MvccTxn},
-        Engine,
     };
 
     pub fn must_succeed<E: Engine>(
@@ -310,6 +314,7 @@ pub mod tests {
         let mut engine = TestEngineBuilder::new().build().unwrap();
 
         let (k, v) = (b"k", b"v");
+        let (k2, v2) = (b"k2", b"v2");
 
         // Shortcuts
         let ts = TimeStamp::compose;
@@ -324,6 +329,23 @@ pub mod tests {
         };
 
         must_prewrite_put_for_large_txn(&mut engine, k, v, k, ts(10, 0), 100, 0);
+        must_prewrite_put_impl(
+            &mut engine,
+            k2,
+            v2,
+            k,
+            &None,
+            ts(10, 0),
+            SkipPessimisticCheck,
+            100,
+            TimeStamp::default(),
+            0,
+            ts(20, 1),
+            TimeStamp::default(),
+            false,
+            Assertion::None,
+            AssertionLevel::Off,
+        );
         check_txn_status::tests::must_success(
             &mut engine,
             k,
@@ -367,46 +389,33 @@ pub mod tests {
             ts(10, 0),
             ts(15, 0),
             ts(20, 1),
-            // Unknown commit role should not collect mvcc
+            // The primary key should not collect mvcc because it is an expected case.
             false,
         );
         check_commit_ts_expired_err(
             must_err(
                 &mut engine,
-                k,
-                ts(10, 0),
-                ts(15, 0),
-                Some(CommitRole::Primary),
-            ),
-            k,
-            ts(10, 0),
-            ts(15, 0),
-            ts(20, 1),
-            // Primary commit should not collect mvcc because it is an expected case.
-            false,
-        );
-        check_commit_ts_expired_err(
-            must_err(
-                &mut engine,
-                k,
+                k2,
                 ts(10, 0),
                 ts(15, 0),
                 Some(CommitRole::Secondary),
             ),
-            k,
+            k2,
             ts(10, 0),
             ts(15, 0),
             ts(20, 1),
-            // Secondary commit should not collect mvcc because it may be a bug.
+            // The secondary key should not collect mvcc because it may be a bug.
             true,
         );
         check_commit_ts_expired_err(
-            must_err(&mut engine, k, ts(10, 0), ts(20, 0), None),
-            k,
+            must_err(&mut engine, k2, ts(10, 0), ts(20, 0), None),
+            k2,
             ts(10, 0),
             ts(20, 0),
             ts(20, 1),
-            false,
+            // The mvcc info should be collected committing secondary keys as it could be a bug.
+            // Although the commit role is none, the primary key could be read from the lock.
+            true,
         );
         must_succeed(&mut engine, k, ts(10, 0), ts(20, 1));
 
