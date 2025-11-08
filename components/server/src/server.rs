@@ -659,6 +659,10 @@ where
         let (recorder_notifier, collector_reg_handle, resource_tag_factory, recorder_worker) =
             resource_metering::init_recorder(
                 self.core.config.resource_metering.precision.as_millis(),
+                self.core
+                    .config
+                    .resource_metering
+                    .enable_network_io_collection,
             );
         self.core.to_stop.push(recorder_worker);
         let (reporter_notifier, data_sink_reg_handle, reporter_worker) =
@@ -798,8 +802,10 @@ where
                     unified_read_pool.as_ref().unwrap().handle(),
                     unified_read_pool_scale_notifier,
                     &self.core.background_worker,
+                    self.core.config.readpool.unified.min_thread_count,
                     self.core.config.readpool.unified.max_thread_count,
                     self.core.config.readpool.unified.auto_adjust_pool_size,
+                    self.core.config.readpool.unified.cpu_threshold,
                 )),
             );
             unified_read_pool_scale_receiver = Some(rx);
